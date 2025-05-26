@@ -23,11 +23,19 @@ type KVServer struct {
 	mu sync.Mutex
 
 	// Your definitions here.
+	kvStore map[string]struct {
+		value   string
+		version rpc.Tversion
+	}
 }
 
 func MakeKVServer() *KVServer {
 	kv := &KVServer{}
 	// Your code here.
+	kv.kvStore = make(map[string]struct {
+		value   string
+		version rpc.Tversion
+	})
 	return kv
 }
 
@@ -35,6 +43,16 @@ func MakeKVServer() *KVServer {
 // exists. Otherwise, Get returns ErrNoKey.
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if data, ok := kv.kvStore[args.Key]; ok {
+		reply.Value = data.value
+		reply.Version = data.version
+		reply.Err = rpc.OK
+	} else {
+		reply.Err = rpc.ErrNoKey
+	}
 }
 
 // Update the value for a key if args.Version matches the version of
@@ -42,7 +60,37 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 // If the key doesn't exist, Put installs the value if the
 // args.Version is 0, and returns ErrNoKey otherwise.
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
-	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	data, exists := kv.kvStore[args.Key]
+
+	if !exists {
+		if args.Version == 0 {
+			// Create new key
+			kv.kvStore[args.Key] = struct {
+				value   string
+				version rpc.Tversion
+			}{args.Value, 1}
+			reply.Err = rpc.OK
+		} else {
+			// Key doesn't exist, and Put version is > 0
+			reply.Err = rpc.ErrNoKey
+		}
+	} else {
+		// Key exists
+		if args.Version == data.version {
+			// Versions match, update value and increment version
+			kv.kvStore[args.Key] = struct {
+				value   string
+				version rpc.Tversion
+			}{args.Value, data.version + 1}
+			reply.Err = rpc.OK
+		} else {
+			// Versions don't match
+			reply.Err = rpc.ErrVersion
+		}
+	}
 }
 
 // You can ignore Kill() for this lab
