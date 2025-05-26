@@ -23,6 +23,27 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type TaskRequest struct {
+	WorkerId int // 可以用来标识不同的 Worker
+}
+
+type TaskResponse struct {
+	TaskType  int // 0 for Map, 1 for Reduce, 2 for Exit
+	TaskId    int
+	InputFile string   // For Map tasks
+	ReduceFiles []string // For Reduce tasks
+	NReduce   int    // Total number of reduce tasks
+}
+
+type TaskCompleteRequest struct {
+	TaskType int
+	TaskId   int
+	Success  bool
+}
+
+type TaskCompleteResponse struct {
+	// Nothing needed for now
+}
 
 
 // Cook up a unique-ish UNIX-domain socket name
