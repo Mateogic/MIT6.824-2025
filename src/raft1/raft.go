@@ -1,97 +1,91 @@
 package raft
 
-// The file raftapi/raft.go defines the interface that raft must
-// expose to servers (or the tester), but see comments below for each
-// of these functions for more details.
-//
-// Make() creates a new raft peer that implements the raft interface.
+// 实现MIT 6.5840 Lab 3的Raft一致性算法
+// 包括领导选举(3A)和日志复制(3B)功能
 
 import (
-	//	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
 )
 
-// Constants for server states
+// 服务器状态常量
 const (
-	Follower = iota
-	Candidate
-	Leader
+	Follower = iota // 跟随者
+	Candidate      // 候选者
+	Leader         // 领导者
 )
 
-// Timing constants
+// 时间常量
 const (
-	HeartbeatInterval       = 120 * time.Millisecond
-	ElectionTimeoutBaseMs   = 400 // Base for election timeout in milliseconds
-	ElectionTimeoutRandomMs = 400 // Random addition to election timeout
+	HeartbeatInterval       = 120 * time.Millisecond // 心跳间隔
+	ElectionTimeoutBaseMs   = 400                    // 选举超时基础时间(毫秒)
+	ElectionTimeoutRandomMs = 400                    // 选举超时随机时间(毫秒)
 )
 
-// LogEntry contains command for state machine, and term when entry was received by leader.
-// Log entries are 1-indexed from the perspective of the paper, but 0-indexed in our rf.log slice.
-// rf.log[0] is a sentinel entry.
+// LogEntry 日志条目结构，包含状态机命令和接收时的任期
+// 日志条目在论文中是1索引的，但在rf.log切片中是0索引的
+// rf.log[0]是哨兵条目
 type LogEntry struct {
-	Term    int
-	Command interface{}
+	Term    int         // 任期
+	Command interface{} // 状态机命令
 }
 
-// AppendEntries RPC arguments structure.
+// AppendEntries RPC参数结构
 type AppendEntriesArgs struct {
-	Term         int        // leader's term
-	LeaderId     int        // so follower can redirect clients
-	PrevLogIndex int        // index of log entry immediately preceding new ones (paper index)
-	PrevLogTerm  int        // term of prevLogIndex entry
-	Entries      []LogEntry // log entries to store (empty for heartbeat)
-	LeaderCommit int        // leader's commitIndex (paper index)
+	Term         int        // 领导者任期
+	LeaderId     int        // 领导者ID，用于跟随者重定向客户端
+	PrevLogIndex int        // 新条目前一个日志条目的索引(论文索引)
+	PrevLogTerm  int        // prevLogIndex条目的任期
+	Entries      []LogEntry // 要存储的日志条目(心跳时为空)
+	LeaderCommit int        // 领导者的commitIndex(论文索引)
 }
 
-// AppendEntries RPC reply structure.
+// AppendEntries RPC回复结构
 type AppendEntriesReply struct {
-	Term    int  // currentTerm, for leader to update itself
-	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	Term    int  // 当前任期，用于领导者更新自己
+	Success bool // 如果跟随者包含匹配prevLogIndex和prevLogTerm的条目则为true
 
-	// For fast log conflict resolution (Lab 3C optimization)
-	ConflictTerm  int // term of the conflicting entry
-	ConflictIndex int // paper index of first entry with that term, or follower's log length if too short
+	// 用于快速日志冲突解决的优化(3C)
+	ConflictTerm  int // 冲突条目的任期
+	ConflictIndex int // 该任期第一个条目的论文索引，或跟随者日志长度(如果太短)
 }
 
-// A Go object implementing a single Raft peer.
+// Raft对象，实现单个Raft节点
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *tester.Persister   // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
+	mu        sync.Mutex          // 保护共享状态的锁
+	peers     []*labrpc.ClientEnd // 所有节点的RPC端点
+	persister *tester.Persister   // 持久化对象
+	me        int                 // 本节点在peers数组中的索引
+	dead      int32               // 由Kill()设置
 
-	// Persistent state on all servers (Updated on stable storage before responding to RPCs)
-	currentTerm int
-	votedFor    int        // candidateId that received vote in current term (or -1 if none)
-	log         []LogEntry // log entries; log[0] is a sentinel entry. Entries are 1-indexed conceptually.
+	// 所有服务器上的持久状态(响应RPC前需在稳定存储上更新)
+	currentTerm int        // 当前任期
+	votedFor    int        // 当前任期投票给的候选者ID(无则为-1)
+	log         []LogEntry // 日志条目；log[0]是哨兵条目
 
-	// Volatile state on all servers
-	state       int // Follower, Candidate, or Leader
-	commitIndex int // index of highest log entry known to be committed (initialized to 0, paper index)
-	lastApplied int // index of highest log entry applied to state machine (initialized to 0, paper index)
+	// 所有服务器上的易失状态
+	state       int // Follower、Candidate或Leader
+	commitIndex int // 已知已提交的最高日志条目索引(论文索引)
+	lastApplied int // 已应用到状态机的最高日志条目索引(论文索引)
 
-	// Volatile state on leaders (Reinitialized after election)
-	nextIndex  []int // for each server, index of the next log entry to send to that server (paper index)
-	matchIndex []int // for each server, index of highest log entry known to be replicated on server (paper index)
+	// 领导者上的易失状态(选举后重新初始化)
+	nextIndex  []int // 对每个服务器，下一个要发送的日志条目索引(论文索引)
+	matchIndex []int // 对每个服务器，已知已复制的最高日志条目索引(论文索引)
 
-	// Channel for sending committed messages to the service/tester
+	// 用于向服务/测试器发送已提交消息的通道
 	applyCh chan raftapi.ApplyMsg
 
-	// Election timer related
-	electionResetEvent time.Time // Time of the last event that reset the election timer (heartbeat, vote granted, or start of election)
+	// 选举定时器相关
+	electionResetEvent time.Time // 最后一次重置选举定时器的事件时间
 }
 
-// return currentTerm and whether this server
-// believes it is the leader.
+// GetState 返回当前任期和该服务器是否认为自己是领导者
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -100,157 +94,104 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-// before you've implemented snapshots, you should pass nil as the
-// second argument to persister.Save().
-// after you've implemented snapshots, pass the current snapshot
-// (or nil if there's not yet a snapshot).
+// persist 将Raft的持久状态保存到稳定存储
+// 见论文Figure 2了解应该持久化什么
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	// 3C阶段代码
 }
 
-
-// restore previously persisted state.
+// readPersist 恢复之前持久化的状态
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 {
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	// 3C阶段代码
 }
 
-// getLastLogIndex returns the index of the last entry in the log (paper index).
-// Log is 0-indexed internally (rf.log), with log[0] as a sentinel.
-// Paper's 1-based indexing means last log index is len(rf.log) - 1 if log[0] is sentinel at paper index 0.
+// getLastLogIndex 返回日志中最后一个条目的索引(论文索引)
 func (rf *Raft) getLastLogIndex() int {
-	// rf.mu must be held by caller or access must be otherwise safe
-	// Since rf.log always contains at least the sentinel, len(rf.log) >= 1.
-	// The paper index of the last log entry is len(rf.log) - 1.
 	return len(rf.log) - 1
 }
 
-// getLastLogTerm returns the term of the last entry in the log.
+// getLastLogTerm 返回日志中最后一个条目的任期
 func (rf *Raft) getLastLogTerm() int {
-	// rf.mu must be held by caller or access must be otherwise safe
-	lastIdx := rf.getLastLogIndex() // This is a paper index
-	// rf.log is 0-indexed, and paper index `i` corresponds to `rf.log[i]`
-	// Since lastIdx is len(rf.log) - 1, it's a valid index for rf.log.
+	lastIdx := rf.getLastLogIndex()
 	return rf.log[lastIdx].Term
 }
 
-// getLogEntryTerm returns the term of the log entry at the given paper index.
-// Converts paper index to internal slice index.
-// Returns term of sentinel if index is 0.
+// getLogEntryTerm 返回给定论文索引处日志条目的任期
 func (rf *Raft) getLogEntryTerm(paperIndex int) int {
-	// rf.mu must be held by caller or access must be otherwise safe
-	// paperIndex directly corresponds to rf.log[paperIndex]
 	if paperIndex < 0 || paperIndex >= len(rf.log) {
-		// This should not happen if logic is correct, especially with sentinel.
-		// For safety, if paperIndex is 0 (sentinel) and log exists, return rf.log[0].Term.
-		// Otherwise, this indicates an issue. For now, rely on caller to provide valid index.
-		// A panic might be appropriate here if index is truly out of bounds for a non-empty log.
-		// If paperIndex is 0 (sentinel index) and log is not empty.
 		if paperIndex == 0 && len(rf.log) > 0 {
 			return rf.log[0].Term
 		}
-		// Consider what to return for an invalid index. For now, assume valid indices.
-		// This path implies an error in logic or state if reached for paperIndex > 0.
-		return -1 // Or panic, indicating an invalid state or request
+		return -1
 	}
 	return rf.log[paperIndex].Term
 }
 
-// getLogStartIndex returns the first valid index in the log (paper index of sentinel).
+// getLogStartIndex 返回日志中第一个有效索引(哨兵的论文索引)
 func (rf *Raft) getLogStartIndex() int {
-	return 0 // Sentinel is at paper index 0, which is rf.log[0]
+	return 0
 }
 
-// how many bytes in Raft's persisted log?
+// PersistBytes 返回Raft持久化日志的字节数
 func (rf *Raft) PersistBytes() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.persister.RaftStateSize()
 }
 
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
+// Snapshot 服务说已创建包含到索引(含)所有信息的快照
+// 这意味着服务不再需要通过(含)该索引的日志
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
-
+	// 3D阶段代码
 }
 
 
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
+// RequestVote RPC参数结构
 type RequestVoteArgs struct {
-	Term         int // candidate's term
-	CandidateId  int // candidate requesting vote
-	LastLogIndex int // index of candidate's last log entry (paper index)
-	LastLogTerm  int // term of candidate's last log entry
+	Term         int // 候选者任期
+	CandidateId  int // 请求投票的候选者ID
+	LastLogIndex int // 候选者最后日志条目的索引(论文索引)
+	LastLogTerm  int // 候选者最后日志条目的任期
 }
 
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
+// RequestVote RPC回复结构
 type RequestVoteReply struct {
-	Term        int  // currentTerm, for candidate to update itself
-	VoteGranted bool // true means candidate received vote
+	Term        int  // 当前任期，用于候选者更新自己
+	VoteGranted bool // true表示候选者收到投票
 }
 
-// convertToFollower transitions the Raft peer to a follower state.
-// rf.mu must be held by the caller.
+// convertToFollower 将Raft节点转换为跟随者状态
+// 调用者必须持有rf.mu锁
 func (rf *Raft) convertToFollower(newTerm int) {
 	rf.state = Follower
 	rf.currentTerm = newTerm
-	rf.votedFor = -1 // Reset votedFor when term changes or converting to follower
-	// rf.persist() // Call persist in Lab 3C
-	// DPrintf("[%d] converted to follower in term %d", rf.me, rf.currentTerm)
+	rf.votedFor = -1
 }
 
-// example RequestVote RPC handler.
+// RequestVote RPC处理器
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// Reply false if term < currentTerm (§5.1)
+	// 如果任期小于当前任期，拒绝投票
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
 
-	// If RPC request contains term T > currentTerm: set currentTerm = T, convert to follower.
+	// 如果RPC请求包含更大的任期，更新当前任期并转为跟随者
 	if args.Term > rf.currentTerm {
 		rf.convertToFollower(args.Term)
-		// rf.persist() // Call persist in Lab 3C
 	}
 
 	reply.Term = rf.currentTerm
-	reply.VoteGranted = false // Default
+	reply.VoteGranted = false
 
-	// Grant vote if votedFor is null or candidateId, and candidate's log is at least as up-to-date. (§5.2, §5.4)
+	// 检查候选者日志是否至少和本节点一样新
 	myLastLogTerm := rf.getLastLogTerm()
 	myLastLogIndex := rf.getLastLogIndex()
 
@@ -263,67 +204,52 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 
+	// 如果还没投票或已投给该候选者，且候选者日志足够新，则投票
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && candidateLogIsUpToDate {
 		rf.votedFor = args.CandidateId
-		// rf.persist() // Call persist in Lab 3C
 		reply.VoteGranted = true
-		rf.electionResetEvent = time.Now() // Reset election timer upon granting vote
-		// DPrintf("[%d] Voted for %d in term %d", rf.me, args.CandidateId, rf.currentTerm)
-	} else {
-		// DPrintf("[%d] Did not vote for %d. MyVotedFor: %d, candidateLogIsUpToDate: %v. MyLastLog(I%d,T%d), CandLastLog(I%d,T%d)",
-		//	rf.me, args.CandidateId, rf.votedFor, candidateLogIsUpToDate, myLastLogIndex, myLastLogTerm, args.LastLogIndex, args.LastLogTerm)
+		rf.electionResetEvent = time.Now() // 投票后重置选举定时器
 	}
 }
 
-// AppendEntries RPC arguments structure is defined earlier.
-// AppendEntries RPC reply structure is defined earlier.
-
-// AppendEntries RPC handler.
+// AppendEntries RPC处理器
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// Reply false if term < currentTerm (§5.1)
+	// 如果任期小于当前任期则回复false (§5.1)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		// DPrintf("[%d] AE from %d: Rejected, args.Term %d < rf.currentTerm %d", rf.me, args.LeaderId, args.Term, rf.currentTerm)
 		return
 	}
 
-	// If RPC request contains term T > currentTerm: set currentTerm = T, convert to follower.
+	// 如果RPC请求包含任期T > currentTerm: 设置currentTerm = T，转换为跟随者
 	if args.Term > rf.currentTerm {
 		rf.convertToFollower(args.Term)
-		// rf.persist() // Call persist in Lab 3C
 	}
 
-	// Reset election timer: crucial for followers to not start elections if leader is alive.
+	// 重置选举定时器：对于跟随者来说至关重要，避免在领导者存活时开始选举
 	rf.electionResetEvent = time.Now()
-	// DPrintf("[%d] AE from %d: Received, reset election timer. MyState: %d, MyTerm: %d, ArgsTerm: %d", rf.me, args.LeaderId, rf.state, rf.currentTerm, args.Term)
 
-	// If candidate receives AppendEntries from a new leader, it transitions to follower.
-	if rf.state == Candidate && args.Term >= rf.currentTerm { // args.Term will be >= rf.currentTerm if we passed the first check or updated term
-		rf.convertToFollower(args.Term) // Ensure state is Follower
-		// rf.persist() // Call persist in Lab 3C
+	// 如果候选者从新领导者接收到AppendEntries，转换为跟随者
+	if rf.state == Candidate && args.Term >= rf.currentTerm {
+		rf.convertToFollower(args.Term) // 确保状态为跟随者
 	}
 
-	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
-	// args.PrevLogIndex is a paper index.
+	// 如果日志在prevLogIndex处不包含匹配prevLogTerm的条目则回复false (§5.3)
 	if args.PrevLogIndex < rf.getLogStartIndex() || args.PrevLogIndex > rf.getLastLogIndex() || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		// DPrintf("[%d] AE from %d: Log mismatch. PrevLogIndex %d (my last: %d, my sentinel: %d), PrevLogTerm %d. My term at PrevLogIndex: %d",
-		//	rf.me, args.LeaderId, args.PrevLogIndex, rf.getLastLogIndex(), rf.getLogStartIndex(), args.PrevLogTerm, rf.getLogEntryTerm(args.PrevLogIndex))
-
 		reply.Term = rf.currentTerm
 		reply.Success = false
 
-		// Optimization for log backtracking (Lab 3C)
-		if args.PrevLogIndex > rf.getLastLogIndex() { // Follower's log is too short
+		// 用于快速日志回退的优化 (Lab 3C)
+		if args.PrevLogIndex > rf.getLastLogIndex() { // 跟随者日志太短
 			reply.ConflictIndex = rf.getLastLogIndex() + 1
-			reply.ConflictTerm = -1 // Using -1 to indicate no specific term, just too short (0 is a valid term for sentinel)
-		} else { // Conflict in existing log
+			reply.ConflictTerm = -1 // 使用-1表示没有特定任期，只是太短(0是哨兵的有效任期)
+		} else { // 现有日志中的冲突
 			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
 			conflictSearchIndex := args.PrevLogIndex
-			// Find the first index in this term (paper index)
+			// 找到该任期中的第一个索引(论文索引)
 			for conflictSearchIndex > rf.getLogStartIndex() && rf.log[conflictSearchIndex-1].Term == reply.ConflictTerm {
 				conflictSearchIndex--
 			}
@@ -332,82 +258,110 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// For Lab 3A (heartbeats), args.Entries is empty.
-	// Log processing (rules 3, 4, 5 from Figure 2) will be for Lab 3B.
+	// 对于Lab 3A(心跳)，args.Entries为空
+	// 日志处理(Figure 2的规则3、4、5)，用于Lab 3B
+	
+	// 如果现有条目与新条目冲突(索引相同但任期不同)，
+	// 删除现有条目及其后续所有条目(§5.3)
+	entryIndex := args.PrevLogIndex + 1 // 第一个新条目的论文索引
+	logInsertionIndex := 0 // args.Entries[]中的索引
+	
+	for logInsertionIndex < len(args.Entries) {
+		// 如果在此位置有现有条目
+		if entryIndex <= rf.getLastLogIndex() {
+			// 检查任期是否匹配
+			if rf.log[entryIndex].Term != args.Entries[logInsertionIndex].Term {
+				// 任期不匹配，删除此条目及其后续所有条目
+				rf.log = rf.log[:entryIndex] // 在此位置截断
+				break
+			}
+			// 任期匹配，跳过此条目因为它已经正确
+		} else {
+			// 已到达日志末尾，跳出循环以追加剩余条目
+			break
+		}
+		entryIndex++
+		logInsertionIndex++
+	}
+	
+	// 追加任何新条目
+	if logInsertionIndex < len(args.Entries) {
+		rf.log = append(rf.log, args.Entries[logInsertionIndex:]...)
+	}
+	
+	// 如果leaderCommit > commitIndex，设置commitIndex = min(leaderCommit, 最后新条目的索引)
+	if args.LeaderCommit > rf.commitIndex {
+		oldCommitIndex := rf.commitIndex
+		newCommitIndex := args.LeaderCommit
+		lastNewEntryIndex := rf.getLastLogIndex()
+		if lastNewEntryIndex < newCommitIndex {
+			newCommitIndex = lastNewEntryIndex
+		}
+		rf.commitIndex = newCommitIndex
+		// 如果commitIndex前进，通知applier协程应用新提交的条目
+		if rf.commitIndex > oldCommitIndex {
+			go rf.applyCommittedEntries()
+		}
+	}
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	// DPrintf("[%d] AE from %d: Success for PrevLogIndex %d, PrevLogTerm %d", rf.me, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm)
 }
 
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
+// sendRequestVote 向服务器发送RequestVote RPC的函数
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
-
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
+// Start 使用Raft的服务(如k/v服务器)想要开始
+// 对下一个要追加到Raft日志的命令的协商。如果此
+// 服务器不是领导者，返回false。否则开始协商并立即返回。
+// 不保证此命令会提交到Raft日志，因为领导者可能失败或输掉选举。
+// 即使Raft实例已被杀死，此函数也应优雅返回。
 //
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
+// 第一个返回值是命令将出现的索引(如果提交)。
+// 第二个返回值是当前任期。
+// 第三个返回值表示此服务器是否认为自己是领导者。
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	index := -1
-	term := -1
-	isLeader := true
+	term := rf.currentTerm
+	isLeader := (rf.state == Leader)
 
-	// Your code here (3B).
+	if !isLeader || rf.killed() {
+		return index, term, false
+	}
 
+	// 创建新日志条目
+	newEntry := LogEntry{
+		Term:    rf.currentTerm,
+		Command: command,
+	}
+
+	// 追加到领导者日志
+	rf.log = append(rf.log, newEntry)
+	index = rf.getLastLogIndex() // 新条目的论文索引
+
+	// 立即开始复制到跟随者(异步)
+	go func() {
+		rf.sendHeartbeats()
+	}()
 
 	return index, term, isLeader
 }
 
-// the tester doesn't halt goroutines created by Raft after each test,
-// but it does call the Kill() method. your code can use killed() to
-// check whether Kill() has been called. the use of atomic avoids the
-// need for a lock.
+// Kill 测试器不会停止每个测试后由Raft创建的协程，
+// 但它会调用Kill()方法。你的代码可以使用killed()来
+// 检查是否已调用Kill()。使用原子操作避免锁的需要。
 //
-// the issue is that long-running goroutines use memory and may chew
-// up CPU time, perhaps causing later tests to fail and generating
-// confusing debug output. any goroutine with a long-running loop
-// should call killed() to check whether it should stop.
+// 问题是长期运行的协程使用内存并可能消耗CPU时间，
+// 可能导致后续测试失败并产生混乱的调试输出。
+// 任何具有长期运行循环的协程都应调用killed()来检查是否应停止。
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
 }
 
 func (rf *Raft) killed() bool {
@@ -415,7 +369,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-// ticker is the main goroutine that drives Raft's behavior, handling election timeouts and heartbeats.
+// ticker 是驱动Raft行为的主协程，处理选举超时和心跳
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -423,34 +377,31 @@ func (rf *Raft) ticker() {
 
 		switch state {
 		case Follower, Candidate:
-			// Check election timeout
+			// 检查选举超时
 			timeoutDuration := time.Duration(ElectionTimeoutBaseMs+rand.Intn(ElectionTimeoutRandomMs)) * time.Millisecond
 			if time.Since(rf.electionResetEvent) > timeoutDuration {
-				// DPrintf("[%d] %v: election timeout (since reset: %v > %v), becoming candidate for term %d", rf.me, state, time.Since(rf.electionResetEvent), timeoutDuration, rf.currentTerm+1)
-				rf.becomeCandidateLocked() // This function handles its own locking nuances for RPCs
+				rf.becomeCandidateLocked() // 此函数处理RPC的锁定细节
 			}
 			rf.mu.Unlock()
-			time.Sleep(10 * time.Millisecond) // Poll frequently for timeout
+			time.Sleep(10 * time.Millisecond) // 频繁轮询超时
 
 		case Leader:
-			// Leader sends heartbeats. sendHeartbeats acquires lock internally.
-			rf.mu.Unlock() // Release lock before calling sendHeartbeats
+			// 领导者发送心跳。sendHeartbeats内部获取锁
+			rf.mu.Unlock() // 调用sendHeartbeats前释放锁
 			rf.sendHeartbeats()
-			time.Sleep(HeartbeatInterval) // Sleep for the heartbeat interval
+			time.Sleep(HeartbeatInterval) // 睡眠心跳间隔
 		}
 	}
 }
 
-// becomeCandidateLocked transitions to candidate state and starts an election.
-// rf.mu must be held by the caller upon entry.
-// This function may unlock and re-lock rf.mu internally when broadcasting RPCs.
+// becomeCandidateLocked 转换为候选者状态并开始选举
+// 调用者必须在进入时持有rf.mu锁
+// 此函数在广播RPC时可能会在内部解锁并重新锁定rf.mu
 func (rf *Raft) becomeCandidateLocked() {
 	rf.state = Candidate
 	rf.currentTerm++
-	rf.votedFor = rf.me // Vote for self
-	rf.electionResetEvent = time.Now() // Reset election timer for this new election round
-	// rf.persist() // Call persist in Lab 3C
-	// DPrintf("[%d] became candidate for term %d. LastLog(I%d, T%d)", rf.me, rf.currentTerm, rf.getLastLogIndex(), rf.getLastLogTerm())
+	rf.votedFor = rf.me // 投票给自己
+	rf.electionResetEvent = time.Now() // 为此新选举轮次重置选举定时器
 
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -458,18 +409,17 @@ func (rf *Raft) becomeCandidateLocked() {
 		LastLogIndex: rf.getLastLogIndex(),
 		LastLogTerm:  rf.getLastLogTerm(),
 	}
-	currentTermWhenStarted := rf.currentTerm // Capture current term for goroutines
+	currentTermWhenStarted := rf.currentTerm // 为协程捕获当前任期
 
-	rf.mu.Unlock() // Unlock before broadcasting, as sendRequestVote might block and RPC handlers lock
+	rf.mu.Unlock() // 广播前解锁，因为sendRequestVote可能阻塞且RPC处理器需要锁
 	rf.broadcastRequestVote(currentTermWhenStarted, args)
-	rf.mu.Lock()   // Re-acquire lock as the main ticker loop expects it to be held after this call if it was held before
+	rf.mu.Lock()   // 重新获取锁，主ticker循环期望在此调用后持有锁
 }
 
-// broadcastRequestVote sends RequestVote RPCs to all other peers.
-// Does not hold rf.mu itself, but callbacks (RPC handlers) will acquire it.
+// broadcastRequestVote 向所有其他节点发送RequestVote RPC
+// 本身不持有rf.mu，但回调(RPC处理器)会获取它
 func (rf *Raft) broadcastRequestVote(electionTerm int, args RequestVoteArgs) {
-	// DPrintf("[%d] broadcasting RequestVote for term %d", rf.me, electionTerm)
-	var votesReceivedAtomic int32 = 1 // Start with 1 for self-vote
+	var votesReceivedAtomic int32 = 1 // 从1开始表示自投票
 	numPeers := len(rf.peers)
 
 	for serverId := range rf.peers {
@@ -477,42 +427,32 @@ func (rf *Raft) broadcastRequestVote(electionTerm int, args RequestVoteArgs) {
 			continue
 		}
 
-		go func(server int, rpcArgs RequestVoteArgs) { // Pass args by value
+		go func(server int, rpcArgs RequestVoteArgs) { // 按值传递参数
 			reply := RequestVoteReply{}
-			// DPrintf("[%d] sending RequestVote to %d for term %d", rpcArgs.CandidateId, server, rpcArgs.Term)
-			ok := rf.sendRequestVote(server, &rpcArgs, &reply) // sendRequestVote is from skeleton
+			ok := rf.sendRequestVote(server, &rpcArgs, &reply)
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 
 			if !ok {
-				// DPrintf("[%d] RequestVote to %d failed or timed out for term %d", rpcArgs.CandidateId, server, rpcArgs.Term)
 				return
 			}
 
-			// Check if still candidate and in the same election term
+			// 检查是否仍是候选者且在同一选举任期
 			if rf.state != Candidate || rf.currentTerm != electionTerm {
-				// DPrintf("[%d] RV reply from %d: No longer candidate or term changed (state %d, myTerm %d, electionTerm %d -> replyTerm %d)",
-				// rpcArgs.CandidateId, server, rf.state, rf.currentTerm, electionTerm, reply.Term)
 				return
 			}
 
 			if reply.Term > rf.currentTerm {
-				// DPrintf("[%d] RV reply from %d: Their term %d > my term %d. Converting to follower.",
-				//	rpcArgs.CandidateId, server, reply.Term, rf.currentTerm)
 				rf.convertToFollower(reply.Term)
-				// rf.persist() // Call persist in Lab 3C
 				return
 			}
 
 			if reply.VoteGranted {
-				// DPrintf("[%d] RV reply from %d: Vote granted for term %d", rpcArgs.CandidateId, server, rpcArgs.Term)
 				newCount := atomic.AddInt32(&votesReceivedAtomic, 1)
-				// DPrintf("[%d] Votes received: %d for term %d (need > %d)", rpcArgs.CandidateId, newCount, rf.currentTerm, numPeers/2)
 				if newCount > int32(numPeers/2) {
-					// Won election
-					if rf.state == Candidate && rf.currentTerm == electionTerm { // Double check state and term
-						// DPrintf("[%d] Won election for term %d with %d votes. Becoming leader.", rpcArgs.CandidateId, rf.currentTerm, newCount)
+					// 赢得选举
+					if rf.state == Candidate && rf.currentTerm == electionTerm { // 双重检查状态和任期
 						rf.becomeLeaderLocked()
 					}
 				}
@@ -521,38 +461,29 @@ func (rf *Raft) broadcastRequestVote(electionTerm int, args RequestVoteArgs) {
 	}
 }
 
-// becomeLeaderLocked transitions to leader state.
-// rf.mu must be held by the caller.
+// becomeLeaderLocked 转换为领导者状态
+// 调用者必须持有rf.mu锁
 func (rf *Raft) becomeLeaderLocked() {
-	if rf.state != Candidate { // Should only transition from Candidate
-		// DPrintf("[%d] Attempted to become leader from state %d (not Candidate) in term %d", rf.me, rf.state, rf.currentTerm)
+	if rf.state != Candidate { // 应该只从候选者转换
 		return
 	}
-	// DPrintf("[%d] transitioning to Leader in term %d", rf.me, rf.currentTerm)
 	rf.state = Leader
 
-	// Initialize nextIndex and matchIndex for all followers (Figure 2)
-	lastLogIdx := rf.getLastLogIndex() // This is a paper index
+	// 为所有跟随者初始化nextIndex和matchIndex (Figure 2)
+	lastLogIdx := rf.getLastLogIndex() // 这是论文索引
 	for i := range rf.peers {
-		rf.nextIndex[i] = lastLogIdx + 1 // Paper index
-		rf.matchIndex[i] = 0             // Paper index, initialized to 0
+		rf.nextIndex[i] = lastLogIdx + 1 // 论文索引
+		rf.matchIndex[i] = 0             // 论文索引，初始化为0
 	}
 
-	// Send initial heartbeats immediately. The main ticker loop for Leader will also send heartbeats periodically.
-	// To ensure quick assertion of leadership, we can call sendHeartbeats here.
-	// sendHeartbeats will acquire its own lock, so release current lock before calling if it's not designed to be re-entrant or expect lock.
-	// However, sendHeartbeats is designed to be called and it will manage its lock.
-	// For safety, and because sendHeartbeats will take the lock, it's better if this function doesn't hold it across that call if sendHeartbeats is substantial.
-	// Given sendHeartbeats spawns goroutines, it's fine to call it while holding the lock here, as the lock is primarily for state transition.
-	// The DPrintf for becoming leader is already printed. We can let the ticker loop send the first heartbeat.
-	// Or, to be explicit and immediate:
-	rf.mu.Unlock() // sendHeartbeats will re-acquire
-	rf.sendHeartbeats() // Send initial heartbeats
-	rf.mu.Lock()   // Re-acquire lock as expected by caller (e.g. broadcastRequestVote's goroutine)
+	// 立即发送初始心跳
+	rf.mu.Unlock() // sendHeartbeats会重新获取锁
+	rf.sendHeartbeats() // 发送初始心跳
+	rf.mu.Lock()   // 重新获取锁以满足调用者期望
 }
 
-// sendHeartbeats sends AppendEntries RPCs (heartbeats) to all peers.
-// This function acquires and releases rf.mu internally.
+// sendHeartbeats 向所有节点发送AppendEntries RPC(心跳)
+// 此函数内部获取和释放rf.mu锁
 func (rf *Raft) sendHeartbeats() {
 	rf.mu.Lock()
 	if rf.state != Leader || rf.killed() {
@@ -562,31 +493,34 @@ func (rf *Raft) sendHeartbeats() {
 
 	currentTerm := rf.currentTerm
 	leaderId := rf.me
-	leaderCommit := rf.commitIndex // For Lab 3B
-
-	// DPrintf("[%d] Leader in term %d sending heartbeats/AE. CommitIdx: %d", rf.me, currentTerm, leaderCommit)
+	leaderCommit := rf.commitIndex // 用于Lab 3B
 
 	for serverId := range rf.peers {
 		if serverId == rf.me {
 			continue
 		}
 
-		// prevLogIndex is a paper index. rf.nextIndex stores paper indices.
+		// prevLogIndex是论文索引。rf.nextIndex存储论文索引
 		prevLogIndex := rf.nextIndex[serverId] - 1
-		// Ensure prevLogIndex is valid. If nextIndex[i] is 1 (logStartIndex + 1), then prevLogIndex is 0 (logStartIndex).
-		if prevLogIndex < rf.getLogStartIndex() { // Sentinel index is getLogStartIndex() (0)
-			prevLogIndex = rf.getLogStartIndex() // Correctly point to sentinel if needed
+		// 确保prevLogIndex有效。如果nextIndex[i]是1(logStartIndex + 1)，则prevLogIndex是0(logStartIndex)
+		if prevLogIndex < rf.getLogStartIndex() { // 哨兵索引是getLogStartIndex() (0)
+			prevLogIndex = rf.getLogStartIndex() // 如需要，正确指向哨兵
 		}
-		prevLogTerm := rf.log[prevLogIndex].Term // rf.log is 0-indexed, prevLogIndex is paper index
+		prevLogTerm := rf.log[prevLogIndex].Term // rf.log是0索引，prevLogIndex是论文索引
 
-		// For heartbeats, Entries is empty. For Lab 3B, this will contain actual log entries.
+		// 对于心跳，Entries为空。对于Lab 3B，这将包含实际日志条目
 		entriesToSend := []LogEntry{}
 
-		// Lab 3B: If there are entries to send for this follower:
-		// lastLogIndex := rf.getLastLogIndex()
-		// if rf.nextIndex[serverId] <= lastLogIndex {
-		// 	 entriesToSend = rf.log[rf.nextIndex[serverId] : lastLogIndex+1] // Slicing rf.log with paper indices
-		// }
+		// Lab 3B: 如果有条目要发送给此跟随者:
+		lastLogIndex := rf.getLastLogIndex()
+		if rf.nextIndex[serverId] <= lastLogIndex {
+			// 确保有效的切片边界
+			startIdx := rf.nextIndex[serverId]
+			endIdx := lastLogIndex + 1
+			if startIdx < len(rf.log) && endIdx <= len(rf.log) && startIdx <= endIdx {
+				entriesToSend = rf.log[startIdx:endIdx] // 用论文索引切片rf.log
+			}
+		}
 
 		args := AppendEntriesArgs{
 			Term:         currentTerm,
@@ -597,58 +531,46 @@ func (rf *Raft) sendHeartbeats() {
 			LeaderCommit: leaderCommit,
 		}
 
-		// Spawn a goroutine to send RPC and handle reply, to avoid blocking the leader's main loop.
-		go func(server int, rpcArgs AppendEntriesArgs) { // Pass args by value
+		// 生成协程发送RPC并处理回复，避免阻塞领导者主循环
+		go func(server int, rpcArgs AppendEntriesArgs) { // 按值传递参数
 			reply := AppendEntriesReply{}
-			// DPrintf("[%d] sending AE to %d for T%d. PrevLog(I%d,T%d). Entries: %d. LeaderCommit: %d",
-			//	rpcArgs.LeaderId, server, rpcArgs.Term, rpcArgs.PrevLogIndex, rpcArgs.PrevLogTerm, len(rpcArgs.Entries), rpcArgs.LeaderCommit)
 			ok := rf.peers[server].Call("Raft.AppendEntries", &rpcArgs, &reply)
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 
 			if !ok {
-				// DPrintf("[%d] AE to %d failed or timed out for T%d", rpcArgs.LeaderId, server, rpcArgs.Term)
 				return
 			}
 
-			// Check if still leader and in the same term; otherwise, result is stale.
+			// 检查是否仍是领导者且在同一任期；否则结果过时
 			if rf.state != Leader || rf.currentTerm != rpcArgs.Term {
-				// DPrintf("[%d] AE reply from %d: No longer leader or term changed (state %d, myTerm %d, args.Term %d -> replyTerm %d)",
-				//	rpcArgs.LeaderId, server, rf.state, rf.currentTerm, rpcArgs.Term, reply.Term)
 				return
 			}
 
 			if reply.Term > rf.currentTerm {
-				// DPrintf("[%d] AE reply from %d: Their term %d > my term %d. Converting to follower.",
-				//	rpcArgs.LeaderId, server, reply.Term, rf.currentTerm)
 				rf.convertToFollower(reply.Term)
-				// rf.persist() // Call persist in Lab 3C
 				return
 			}
 
 			if reply.Success {
-				// Heartbeat (or log entries if any) was successful.
-				// Update nextIndex and matchIndex for this follower.
-				// DPrintf("[%d] AE to %d successful for T%d. PrevLogIndex %d, len(Entries) %d",
-				//	rpcArgs.LeaderId, server, rpcArgs.Term, rpcArgs.PrevLogIndex, len(rpcArgs.Entries))
-				rf.matchIndex[server] = rpcArgs.PrevLogIndex + len(rpcArgs.Entries) // Paper index
-				rf.nextIndex[server] = rf.matchIndex[server] + 1                   // Paper index
+				// 心跳(或日志条目，如果有的话)成功
+				// 更新此跟随者的nextIndex和matchIndex
+				rf.matchIndex[server] = rpcArgs.PrevLogIndex + len(rpcArgs.Entries) // 论文索引
+				rf.nextIndex[server] = rf.matchIndex[server] + 1                   // 论文索引
 
-				// Lab 3B: Update commitIndex if a majority of followers have replicated up to a certain point in the current term.
-				// rf.updateCommitIndexLocked()
+				// Lab 3B: 如果大多数跟随者已复制到当前任期的某点，更新commitIndex
+				rf.updateCommitIndexLocked()
 			} else {
-				// Follower rejected. Decrement nextIndex and retry. (Lab 3B/3C)
-				// DPrintf("[%d] AE to %d FAILED for T%d. Reply Term: %d. Conflict(T%d, I%d)",
-				//	rpcArgs.LeaderId, server, rpcArgs.Term, reply.Term, reply.ConflictTerm, reply.ConflictIndex)
+				// 跟随者拒绝。递减nextIndex并重试 (Lab 3B/3C)
 
-				// Use conflict info to backtrack nextIndex more efficiently (Lab 3C)
-				if reply.ConflictTerm == -1 { // Follower's log is too short, ConflictIndex is follower's log length + 1
-					rf.nextIndex[server] = reply.ConflictIndex // Paper index
+				// 使用冲突信息更高效地回退nextIndex (Lab 3C)
+				if reply.ConflictTerm == -1 { // 跟随者日志太短，ConflictIndex是跟随者日志长度+1
+					rf.nextIndex[server] = reply.ConflictIndex // 论文索引
 				} else {
-					// Search leader's log for the last entry with ConflictTerm (paper index)
+					// 在领导者日志中搜索具有ConflictTerm的最后条目(论文索引)
 					leaderLastIndexWithConflictTerm := -1
-					for i := rf.getLastLogIndex(); i >= rf.getLogStartIndex(); i-- { // Iterate paper indices
+					for i := rf.getLastLogIndex(); i >= rf.getLogStartIndex(); i-- { // 迭代论文索引
 						if rf.log[i].Term == reply.ConflictTerm {
 							leaderLastIndexWithConflictTerm = i
 							break
@@ -656,67 +578,139 @@ func (rf *Raft) sendHeartbeats() {
 					}
 
 					if leaderLastIndexWithConflictTerm != -1 {
-						// Leader has ConflictTerm. Set nextIndex to leader's entry after that term.
-						rf.nextIndex[server] = leaderLastIndexWithConflictTerm + 1 // Paper index
+						// 领导者有ConflictTerm。将nextIndex设置为该任期后的领导者条目
+						rf.nextIndex[server] = leaderLastIndexWithConflictTerm + 1 // 论文索引
 					} else {
-						// Leader does not have ConflictTerm. Set nextIndex to follower's conflicting entry.
-						rf.nextIndex[server] = reply.ConflictIndex // Paper index
+						// 领导者没有ConflictTerm。将nextIndex设置为跟随者的冲突条目
+						rf.nextIndex[server] = reply.ConflictIndex // 论文索引
 					}
 				}
-				// Ensure nextIndex does not go below sentinel_index + 1 (paper index 1)
+				// 确保nextIndex不低于sentinel_index + 1 (论文索引1)
 				if rf.nextIndex[server] <= rf.getLogStartIndex() {
 					rf.nextIndex[server] = rf.getLogStartIndex() + 1
 				}
-				// DPrintf("[%d] Adjusted nextIndex for server %d to %d", rpcArgs.LeaderId, server, rf.nextIndex[server])
 			}
 		}(serverId, args)
 	}
-	rf.mu.Unlock() // Unlock after iterating through peers and spawning goroutines
+	rf.mu.Unlock() // 迭代节点并生成协程后解锁
 }
 
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
+// updateCommitIndexLocked 基于匹配索引更新提交索引
+// 调用者必须持有rf.mu锁
+func (rf *Raft) updateCommitIndexLocked() {
+	if rf.state != Leader {
+		return
+	}
+
+	// 找到在大多数服务器上复制的最高索引
+	for n := rf.getLastLogIndex(); n > rf.commitIndex; n-- {
+		// 只提交当前任期的条目以避免Figure 8问题
+		if rf.log[n].Term != rf.currentTerm {
+			continue
+		}
+
+		// 计算有多少服务器有此条目
+		count := 1 // 领导者本身
+		for i := range rf.peers {
+			if i != rf.me && rf.matchIndex[i] >= n {
+				count++
+			}
+		}
+
+		// 如果大多数已复制此条目，提交它
+		if count > len(rf.peers)/2 {
+			oldCommitIndex := rf.commitIndex
+			rf.commitIndex = n
+			// 如果commitIndex前进，应用新提交的条目
+			if rf.commitIndex > oldCommitIndex {
+				go rf.applyCommittedEntries()
+			}
+			break
+		}
+	}
+}
+
+// applyCommittedEntries 由于我们有专门的applier协程，不再需要
+// 此函数保留用于兼容性，但什么都不做
+func (rf *Raft) applyCommittedEntries() {
+	// 专门的applier协程处理应用条目
+}
+
+// applier 是将提交的条目应用到状态机的专门协程
+func (rf *Raft) applier() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		
+		// 检查是否有条目要应用
+		if rf.lastApplied < rf.commitIndex {
+			// 收集要应用的条目
+			startIdx := rf.lastApplied + 1
+			endIdx := rf.commitIndex
+			
+			entriesToApply := make([]raftapi.ApplyMsg, 0, endIdx-startIdx+1)
+			
+			for i := startIdx; i <= endIdx; i++ {
+				entry := rf.log[i]
+				msg := raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      entry.Command,
+					CommandIndex: i, // 论文索引
+				}
+				entriesToApply = append(entriesToApply, msg)
+			}
+			
+			rf.lastApplied = rf.commitIndex
+			rf.mu.Unlock()
+			
+			// 在不持有锁的情况下应用条目
+			for _, msg := range entriesToApply {
+				rf.applyCh <- msg
+			}
+		} else {
+			rf.mu.Unlock()
+			time.Sleep(10 * time.Millisecond) // 如果没有要应用的内容则短暂睡眠
+		}
+	}
+}
+
+// Make 服务或测试器想要创建Raft服务器。所有Raft服务器
+// (包括此服务器)的端口在peers[]中。此服务器的端口是peers[me]。
+// 所有服务器的peers[]数组具有相同的顺序。persister是此服务器
+// 保存其持久状态的地方，也初始包含最近保存的状态(如果有)。
+// applyCh是测试器或服务期望Raft发送ApplyMsg消息的通道。
+// Make()必须快速返回，因此应为任何长期运行的工作启动协程。
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.applyCh = applyCh // Store applyCh
+	rf.applyCh = applyCh // 存储applyCh
 
-	// Your initialization code here (3A, 3B, 3C).
-	// --- BEGIN INITIALIZATION ---
+	// 初始化代码 (3A, 3B, 3C)
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = make([]LogEntry, 1) // Initialize with one sentinel entry at paper index 0
-	rf.log[0] = LogEntry{Term: 0, Command: nil} // Sentinel entry
+	rf.log = make([]LogEntry, 1) // 在论文索引0处初始化一个哨兵条目
+	rf.log[0] = LogEntry{Term: 0, Command: nil} // 哨兵条目
 
-	rf.commitIndex = 0 // Paper index
-	rf.lastApplied = 0 // Paper index
+	rf.commitIndex = 0 // 论文索引
+	rf.lastApplied = 0 // 论文索引
 
 	rf.state = Follower
-	rf.electionResetEvent = time.Now() // Initialize election timer reset event
+	rf.electionResetEvent = time.Now() // 初始化选举定时器重置事件
 
-	// Initialize volatile state on leaders (reinitialized after election, but good to init here)
+	// 初始化领导者上的易失状态(选举后重新初始化，但在此初始化是好的)
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
-	// Initial values for nextIndex and matchIndex will be set when a server becomes leader.
-	// For now, zero values are fine. Leader will set nextIndex to its last log index + 1.
-	// --- END INITIALIZATION ---
 
-	// initialize from state persisted before a crash
+	// 从崩溃前持久化的状态初始化
 	rf.readPersist(persister.ReadRaftState())
 
-	// start ticker goroutine to start elections
+	// 启动ticker协程以开始选举
 	go rf.ticker()
 
+	// 启动applier协程以应用提交的条目
+	go rf.applier()
 
 	return rf
 }
