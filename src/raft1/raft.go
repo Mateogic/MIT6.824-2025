@@ -4,11 +4,13 @@ package raft
 // 包括领导选举(3A)和日志复制(3B)功能
 
 import (
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -97,7 +99,14 @@ func (rf *Raft) GetState() (int, bool) {
 // persist 将Raft的持久状态保存到稳定存储
 // 见论文Figure 2了解应该持久化什么
 func (rf *Raft) persist() {
-	// 3C阶段代码
+	// 将持久状态编码为字节数组
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.Save(data, nil)
 }
 
 // readPersist 恢复之前持久化的状态
@@ -105,7 +114,22 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 {
 		return
 	}
-	// 3C阶段代码
+	// 从字节数组解码持久状态
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		// 解码失败
+		return
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // getLastLogIndex 返回日志中最后一个条目的索引(论文索引)
@@ -169,6 +193,7 @@ func (rf *Raft) convertToFollower(newTerm int) {
 	rf.state = Follower
 	rf.currentTerm = newTerm
 	rf.votedFor = -1
+	rf.persist()
 }
 
 // RequestVote RPC处理器
@@ -207,6 +232,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 如果还没投票或已投给该候选者，且候选者日志足够新，则投票
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && candidateLogIsUpToDate {
 		rf.votedFor = args.CandidateId
+		rf.persist()
 		reply.VoteGranted = true
 		rf.electionResetEvent = time.Now() // 投票后重置选举定时器
 	}
@@ -273,6 +299,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.log[entryIndex].Term != args.Entries[logInsertionIndex].Term {
 				// 任期不匹配，删除此条目及其后续所有条目
 				rf.log = rf.log[:entryIndex] // 在此位置截断
+				rf.persist()
 				break
 			}
 			// 任期匹配，跳过此条目因为它已经正确
@@ -287,6 +314,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 追加任何新条目
 	if logInsertionIndex < len(args.Entries) {
 		rf.log = append(rf.log, args.Entries[logInsertionIndex:]...)
+		rf.persist()
 	}
 	
 	// 如果leaderCommit > commitIndex，设置commitIndex = min(leaderCommit, 最后新条目的索引)
@@ -343,6 +371,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// 追加到领导者日志
 	rf.log = append(rf.log, newEntry)
+	rf.persist()
 	index = rf.getLastLogIndex() // 新条目的论文索引
 
 	// 立即开始复制到跟随者(异步)
@@ -401,6 +430,7 @@ func (rf *Raft) becomeCandidateLocked() {
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me // 投票给自己
+	rf.persist()
 	rf.electionResetEvent = time.Now() // 为此新选举轮次重置选举定时器
 
 	args := RequestVoteArgs{
