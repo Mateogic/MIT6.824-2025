@@ -365,13 +365,17 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	// 发送快照到applyCh
 	go func() {
+		if rf.killed() {
+			return
+		}
 		DPrintf("[S%v] applyCh <- Snapshot idx=%v term=%v", rf.me, args.LastIncludedIndex, args.LastIncludedTerm)
-		rf.applyCh <- raftapi.ApplyMsg{
+	msg := raftapi.ApplyMsg{
 			SnapshotValid: true,
 			Snapshot:      args.Data,
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
 		}
+	rf.applyCh <- msg
 	}()
 }
 
@@ -892,6 +896,11 @@ func (rf *Raft) applyCommittedEntries() {
 
 // applier 是将提交的条目应用到状态机的专门协程
 func (rf *Raft) applier() {
+	defer func() {
+		// close channel to signal shutdown
+		defer func() { recover() }()
+		close(rf.applyCh)
+	}()
 	for !rf.killed() {
 		rf.mu.Lock()
 		
