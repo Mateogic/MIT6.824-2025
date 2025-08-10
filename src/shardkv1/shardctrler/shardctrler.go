@@ -5,13 +5,25 @@ package shardctrler
 //
 
 import (
+	"log"
+	"time"
 
 	"6.5840/kvsrv1"
+	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
+	"6.5840/shardkv1/shardgrp"
 	"6.5840/tester1"
 )
 
+// toggle controller debug logging
+const debugSck = false
+
+func dlogf(format string, args ...any) {
+	if debugSck {
+		log.Printf(format, args...)
+	}
+}
 
 // ShardCtrler for the controller and kv clerk.
 type ShardCtrler struct {
@@ -44,7 +56,13 @@ func (sck *ShardCtrler) InitController() {
 // pick the key to name the configuration.  The initial configuration
 // lists shardgrp shardcfg.Gid1 for all shards.
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
-	// Your code here
+	if sck.IKVClerk == nil {
+		log.Fatalf("InitConfig: IKVClerk is nil")
+	}
+	// choose a fixed key to store the current configuration
+	const cfgCurKey = "shardcfg/current"
+	// store initial config at version 0
+	_ = sck.IKVClerk.Put(cfgCurKey, cfg.String(), 0)
 }
 
 // Called by the tester to ask the controller to change the
@@ -52,13 +70,99 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // changes the configuration it may be superseded by another
 // controller.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
-	// Your code here.
+	// Part A: sequential reconfiguration without failures.
+	cur := sck.Query()
+	if new.Num <= cur.Num {
+		return
+	}
+	dlogf("[sck] ChangeConfigTo: cur=%d -> new=%d", cur.Num, new.Num)
+	// For each shard, if moving from gidA->gidB
+	// Keep retrying until Freeze/Install/Delete succeed (OK or ErrVersion),
+	// so that we don't publish a config that points clients at a group that
+	// doesn't yet own the shard.
+	const wait = 5 * time.Millisecond
+	for s := 0; s < shardcfg.NShards; s++ {
+		sh := shardcfg.Tshid(s)
+		from := cur.Shards[s]
+		to := new.Shards[s]
+		if from == to {
+			continue
+		}
+		dlogf("[sck] move shard %d: %d -> %d", s, from, to)
+		if srvs, ok := cur.Groups[from]; ok && from != 0 {
+			ckFrom := shardgrp.MakeClerk(sck.clnt, srvs)
+			var state []byte
+			tries := 0
+			t0 := time.Now()
+			for {
+				st, err := ckFrom.FreezeShard(sh, new.Num)
+				tries++
+				if err == rpc.OK {
+					dlogf("[sck] Freeze shard %d@%d -> OK state=%dB tries=%d dur=%v", s, from, len(st), tries, time.Since(t0))
+					state = st
+					break
+				}
+				if err == rpc.ErrVersion {
+					dlogf("[sck] Freeze shard %d@%d -> ErrVersion tries=%d dur=%v", s, from, tries, time.Since(t0))
+					break
+				}
+				if tries%50 == 0 {
+					dlogf("[sck] Freeze retry shard %d@%d num=%d tries=%d dur=%v", s, from, new.Num, tries, time.Since(t0))
+				}
+				time.Sleep(wait)
+			}
+			if dsrvs, ok2 := new.Groups[to]; ok2 && to != 0 {
+				ckTo := shardgrp.MakeClerk(sck.clnt, dsrvs)
+				tries = 0
+				t0 = time.Now()
+				for {
+					err := ckTo.InstallShard(sh, state, new.Num)
+					tries++
+					if err == rpc.OK || err == rpc.ErrVersion {
+						dlogf("[sck] Install shard %d@%d -> %v tries=%d dur=%v", s, to, err, tries, time.Since(t0))
+						break
+					}
+					if tries%50 == 0 {
+						dlogf("[sck] Install retry shard %d@%d num=%d tries=%d dur=%v", s, to, new.Num, tries, time.Since(t0))
+					}
+					time.Sleep(wait)
+				}
+			}
+			tries = 0
+			t0 = time.Now()
+			for {
+				err := ckFrom.DeleteShard(sh, new.Num)
+				tries++
+				if err == rpc.OK || err == rpc.ErrVersion {
+					dlogf("[sck] Delete shard %d@%d -> %v tries=%d dur=%v", s, from, err, tries, time.Since(t0))
+					break
+				}
+				if tries%50 == 0 {
+					dlogf("[sck] Delete retry shard %d@%d num=%d tries=%d dur=%v", s, from, new.Num, tries, time.Since(t0))
+				}
+				time.Sleep(wait)
+			}
+		} else {
+			dlogf("[sck] skip shard %d from %d (no servers)", s, from)
+		}
+	}
+	const cfgCurKey = "shardcfg/current"
+	_ = sck.IKVClerk.Put(cfgCurKey, new.String(), rpc.Tversion(cur.Num))
+	dlogf("[sck] published new config num=%d", new.Num)
 }
-
 
 // Return the current configuration
 func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
-	// Your code here.
-	return nil
+	const cfgCurKey = "shardcfg/current"
+	if sck.IKVClerk == nil {
+		log.Fatalf("Query: IKVClerk is nil")
+	}
+	val, _, err := sck.IKVClerk.Get(cfgCurKey)
+	if err == rpc.ErrNoKey {
+		// return empty config
+		return shardcfg.MakeShardConfig()
+	}
+	// OK or ErrNoKey already handled
+	return shardcfg.FromString(val)
 }
 

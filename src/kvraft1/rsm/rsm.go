@@ -122,6 +122,9 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
+	// overall safety timeout to avoid indefinite blocking if no progress
+	overall := time.NewTimer(2 * time.Second)
+	defer overall.Stop()
 	for {
 		select {
 		case res, ok := <-ch:
@@ -141,6 +144,12 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 				rsm.mu.Unlock()
 				return rpc.ErrWrongLeader, nil
 			}
+		case <-overall.C:
+			// give up after a while to avoid test hangs
+			rsm.mu.Lock()
+			delete(rsm.waitCh, index)
+			rsm.mu.Unlock()
+			return rpc.ErrWrongLeader, nil
 		case <-rsm.doneCh:
 			return rpc.ErrWrongLeader, nil
 		}
