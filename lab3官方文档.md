@@ -146,13 +146,14 @@ You will probably need the optimization that backs up nextIndex by more than one
     XTerm:  term in the conflicting entry (if any)
     XIndex: index of first entry with that term (if any)
     XLen:   log length
-Then the leader's logic can be something like: A few other hints:
+Then the leader's logic can be something like:
   Case 1: leader doesn't have XTerm:
     nextIndex = XIndex
   Case 2: leader has XTerm:
     nextIndex = (index of leader's last entry for XTerm) + 1
   Case 3: follower's log is too short:
     nextIndex = XLen
+A few other hints:
 Run git pull to get the latest lab software.
 The 3C tests are more demanding than those for 3A or 3B, and failures may be caused by problems in your code for 3A or 3B.
 Your code should pass all the 3C tests (as shown below), as well as the 3A and 3B tests.

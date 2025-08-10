@@ -119,8 +119,9 @@ func (rs *rfsrv) applier(applyCh chan raftapi.ApplyMsg) {
 
 // periodically snapshot raft state
 func (rs *rfsrv) applierSnap(applyCh chan raftapi.ApplyMsg) {
-	if rs.raft == nil {
-		return // ???
+	// Use locked access to rs.raft to avoid data races with Kill().
+	if rs.Raft() == nil {
+		return // no raft to drive snapshots
 	}
 
 	for m := range applyCh {
@@ -152,7 +153,12 @@ func (rs *rfsrv) applierSnap(applyCh chan raftapi.ApplyMsg) {
 				}
 				e.Encode(xlog)
 				start := tester.GetAnnotateTimestamp()
-				rs.raft.Snapshot(m.CommandIndex, w.Bytes())
+				// Snapshot through a locked getter in case Kill() concurrently set rs.raft=nil.
+				if r := rs.Raft(); r != nil {
+					r.Snapshot(m.CommandIndex, w.Bytes())
+				} else {
+					// raft instance no longer available; skip snapshot to avoid panic
+				}
 				details := fmt.Sprintf(
 					"snapshot created after applying the command at index %v",
 					m.CommandIndex)

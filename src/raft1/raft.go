@@ -263,6 +263,7 @@ type RequestVoteReply struct {
 // convertToFollower 将Raft节点转换为跟随者状态
 // 调用者必须持有rf.mu锁
 func (rf *Raft) convertToFollower(newTerm int) {
+	DPrintf("[S%v] convertToFollower term %v -> %v", rf.me, rf.currentTerm, newTerm)
 	rf.state = Follower
 	rf.currentTerm = newTerm
 	rf.votedFor = -1
@@ -316,59 +317,55 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	DPrintf("[S%v] InstallSnapshot from L%v term=%v lastIdx=%v lastTerm=%v (myTerm=%v lastIncIdx=%v)", rf.me, args.LeaderId, args.Term, args.LastIncludedIndex, args.LastIncludedTerm, rf.currentTerm, rf.lastIncludedIndex)
 	reply.Term = rf.currentTerm
 
-	// 1. Reply immediately if term < currentTerm
+	// 如果任期小于当前任期则拒绝
 	if args.Term < rf.currentTerm {
 		return
 	}
 
-	// If term > currentTerm, set currentTerm = term, convert to follower
+	// 如果RPC请求包含更大的任期，更新当前任期并转为跟随者
 	if args.Term > rf.currentTerm {
 		rf.convertToFollower(args.Term)
 		reply.Term = rf.currentTerm
 	}
 
-	// Reset election timer
+	// 重置选举定时器
 	rf.electionResetEvent = time.Now()
 
-	// 6. If existing log entry has same index and term as snapshot's last included entry, retain log entries following it and reply
+	// 如果快照过时，忽略
 	if args.LastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
 
-	// Check if we can preserve some log entries after the snapshot
-	newLog := make([]LogEntry, 1)
-	newLog[0] = LogEntry{Term: args.LastIncludedTerm, Command: nil}
-
-	// If we have log entries beyond the snapshot index, we might keep some
-	if args.LastIncludedIndex < rf.getLastLogIndex() {
-		// Find the array index for the snapshot index
-		snapArrayIndex := rf.paperToArrayIndex(args.LastIncludedIndex)
-		if snapArrayIndex >= 0 && snapArrayIndex < len(rf.log) {
-			// If the log entry at snapshot index has the same term, keep subsequent entries
-			if rf.log[snapArrayIndex].Term == args.LastIncludedTerm {
-				newLog = append(newLog, rf.log[snapArrayIndex+1:]...)
-			}
+	// 截断日志
+	if args.LastIncludedIndex <= rf.getLastLogIndex() && rf.getLogEntryTerm(args.LastIncludedIndex) == args.LastIncludedTerm {
+		// 保留快照后的日志
+		arrayIndex := rf.paperToArrayIndex(args.LastIncludedIndex)
+		newLog := make([]LogEntry, 1, len(rf.log)-arrayIndex)
+		newLog[0] = LogEntry{Term: args.LastIncludedTerm, Command: nil}
+		if arrayIndex+1 < len(rf.log) {
+			newLog = append(newLog, rf.log[arrayIndex+1:]...)
 		}
+		rf.log = newLog
+	} else {
+		// 丢弃整个日志
+		rf.log = []LogEntry{{Term: args.LastIncludedTerm, Command: nil}}
 	}
 
-	// 7. Discard entire log or keep matching suffix
-	rf.log = newLog
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
 	rf.snapshot = args.Data
 
-	// 8. Reset state machine using snapshot contents
 	rf.lastApplied = args.LastIncludedIndex
-	if rf.commitIndex < args.LastIncludedIndex {
-		rf.commitIndex = args.LastIncludedIndex
-	}
+	rf.commitIndex = args.LastIncludedIndex
 
 	rf.persist()
 
-	// Send snapshot to application via applyCh
+	// 发送快照到applyCh
 	go func() {
+		DPrintf("[S%v] applyCh <- Snapshot idx=%v term=%v", rf.me, args.LastIncludedIndex, args.LastIncludedTerm)
 		rf.applyCh <- raftapi.ApplyMsg{
 			SnapshotValid: true,
 			Snapshot:      args.Data,
@@ -383,6 +380,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	DPrintf("[S%v] AppendEntries from L%v term=%v prevIdx=%v prevTerm=%v entries=%d leaderCommit=%v (myTerm=%v lastIdx=%v lastIncIdx=%v)", rf.me, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderCommit, rf.currentTerm, rf.getLastLogIndex(), rf.lastIncludedIndex)
 	// 如果任期小于当前任期则回复false (§5.1)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -786,11 +784,13 @@ func (rf *Raft) sendHeartbeats() {
 			defer rf.mu.Unlock()
 
 			if !ok {
+				DPrintf("[L%v T%v] AE to S%v failed (rpc), prevIdx=%v ents=%d", rf.me, rpcArgs.Term, server, rpcArgs.PrevLogIndex, len(rpcArgs.Entries))
 				return
 			}
 
 			// 检查是否仍是领导者且在同一任期；否则结果过时
 			if rf.state != Leader || rf.currentTerm != rpcArgs.Term {
+				DPrintf("[L%v T%v] AE reply from S%v ignored (state=%v termNow=%v) for prevIdx=%v", rf.me, rpcArgs.Term, server, rf.state, rf.currentTerm, rpcArgs.PrevLogIndex)
 				return
 			}
 
@@ -804,6 +804,7 @@ func (rf *Raft) sendHeartbeats() {
 				// 更新此跟随者的nextIndex和matchIndex
 				rf.matchIndex[server] = rpcArgs.PrevLogIndex + len(rpcArgs.Entries) // 论文索引
 				rf.nextIndex[server] = rf.matchIndex[server] + 1                   // 论文索引
+				DPrintf("[L%v T%v] AE success from S%v -> match=%v next=%v", rf.me, rf.currentTerm, server, rf.matchIndex[server], rf.nextIndex[server])
 
 				// Lab 3B: 如果大多数跟随者已复制到当前任期的某点，更新commitIndex
 				rf.updateCommitIndexLocked()
@@ -813,6 +814,7 @@ func (rf *Raft) sendHeartbeats() {
 				// 使用冲突信息更高效地回退nextIndex (Lab 3C)
 				if reply.ConflictTerm == -1 { // 跟随者日志太短，ConflictIndex是跟随者日志长度+1
 					rf.nextIndex[server] = reply.ConflictIndex // 论文索引
+					DPrintf("[L%v T%v] AE reject from S%v (too short), set next=%v", rf.me, rf.currentTerm, server, rf.nextIndex[server])
 				} else {
 					// 在领导者日志中搜索具有ConflictTerm的最后条目(论文索引)
 					leaderLastIndexWithConflictTerm := -1
@@ -826,15 +828,16 @@ func (rf *Raft) sendHeartbeats() {
 					if leaderLastIndexWithConflictTerm != -1 {
 						// 领导者有ConflictTerm。将nextIndex设置为该任期后的领导者条目
 						rf.nextIndex[server] = leaderLastIndexWithConflictTerm + 1 // 论文索引
+						DPrintf("[L%v T%v] AE reject from S%v (conflict term matches leader at %v), set next=%v", rf.me, rf.currentTerm, server, leaderLastIndexWithConflictTerm, rf.nextIndex[server])
 					} else {
 						// 领导者没有ConflictTerm。将nextIndex设置为跟随者的冲突条目
 						rf.nextIndex[server] = reply.ConflictIndex // 论文索引
+						DPrintf("[L%v T%v] AE reject from S%v (no conflict term), set next=%v", rf.me, rf.currentTerm, server, rf.nextIndex[server])
 					}
 				}
-				// 确保nextIndex不低于lastIncludedIndex + 1
-				if rf.nextIndex[server] <= rf.lastIncludedIndex {
-					rf.nextIndex[server] = rf.lastIncludedIndex + 1
-				}
+				// 不要把nextIndex强行提升到lastIncludedIndex+1；
+				// 让它保持<= lastIncludedIndex以便下一轮改为发送快照。
+				DPrintf("[L%v T%v] after adjust, S%v next=%v (lastInc=%v)", rf.me, rf.currentTerm, server, rf.nextIndex[server], rf.lastIncludedIndex)
 			}
 		}(serverId, args)
 	}
@@ -904,10 +907,10 @@ func (rf *Raft) applier() {
 				rf.lastApplied = rf.lastIncludedIndex
 			}
 			
-			if startIdx <= endIdx && startIdx <= rf.getLastLogIndex() {
+			if startIdx <= endIdx {
 				entriesToApply := make([]raftapi.ApplyMsg, 0, endIdx-startIdx+1)
 				
-				for i := startIdx; i <= endIdx && i <= rf.getLastLogIndex(); i++ {
+				for i := startIdx; i <= endIdx; i++ {
 					arrayIndex := rf.paperToArrayIndex(i)
 					if arrayIndex >= 0 && arrayIndex < len(rf.log) {
 						entry := rf.log[arrayIndex]
@@ -920,17 +923,12 @@ func (rf *Raft) applier() {
 					}
 				}
 				
-				if len(entriesToApply) > 0 {
-					lastAppliedIndex := entriesToApply[len(entriesToApply)-1].CommandIndex
-					rf.lastApplied = lastAppliedIndex
-					rf.mu.Unlock()
-					
-					// 在不持有锁的情况下应用条目
-					for _, msg := range entriesToApply {
-						rf.applyCh <- msg
-					}
-				} else {
-					rf.mu.Unlock()
+				rf.lastApplied = endIdx
+				rf.mu.Unlock()
+				
+				// 在不持有锁的情况下应用条目
+				for _, msg := range entriesToApply {
+					rf.applyCh <- msg
 				}
 			} else {
 				rf.mu.Unlock()
