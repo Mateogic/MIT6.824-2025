@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"sync"
 	"sync/atomic"
 
 	"6.5840/kvraft1/rsm"
@@ -17,6 +19,9 @@ type KVServer struct {
 	rsm  *rsm.RSM
 
 	// Your definitions here.
+	mu      sync.Mutex
+	kv      map[string]string
+	vers    map[string]rpc.Tversion
 }
 
 // To type-cast req to the right type, take a look at Go's type switches or type
@@ -25,29 +30,94 @@ type KVServer struct {
 // https://go.dev/tour/methods/16
 // https://go.dev/tour/methods/15
 func (kv *KVServer) DoOp(req any) any {
-	// Your code here
-	return nil
+	switch v := req.(type) {
+	case rpc.GetArgs:
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		if val, ok := kv.kv[v.Key]; ok {
+			return rpc.GetReply{Value: val, Version: kv.vers[v.Key], Err: rpc.OK}
+		}
+		return rpc.GetReply{Err: rpc.ErrNoKey}
+	case rpc.PutArgs:
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		curVal, exists := kv.kv[v.Key]
+		curVer := kv.vers[v.Key]
+		if !exists {
+			if v.Version == 0 {
+				kv.kv[v.Key] = v.Value
+				kv.vers[v.Key] = 1
+				return rpc.PutReply{Err: rpc.OK}
+			}
+			return rpc.PutReply{Err: rpc.ErrNoKey}
+		}
+		// exists
+		if v.Version == curVer {
+			kv.kv[v.Key] = v.Value
+			kv.vers[v.Key] = curVer + 1
+			return rpc.PutReply{Err: rpc.OK}
+		}
+		_ = curVal // unused except for clarity
+		return rpc.PutReply{Err: rpc.ErrVersion}
+	default:
+		// unknown op
+		return nil
+	}
 }
 
 func (kv *KVServer) Snapshot() []byte {
-	// Your code here
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	// encode as two maps to avoid unexported fields
+	e.Encode(kv.kv)
+	e.Encode(kv.vers)
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
-	// Your code here
+	if len(data) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	m1 := make(map[string]string)
+	m2 := make(map[string]rpc.Tversion)
+	if d.Decode(&m1) == nil && d.Decode(&m2) == nil {
+		kv.mu.Lock()
+		kv.kv = m1
+		kv.vers = m2
+		kv.mu.Unlock()
+	}
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
-	// Your code here. Use kv.rsm.Submit() to submit args
-	// You can use go's type casts to turn the any return value
-	// of Submit() into a GetReply: rep.(rpc.GetReply)
+	if atomic.LoadInt32(&kv.dead) == 1 {
+		reply.Err = rpc.ErrWrongLeader
+		return
+	}
+	err, rep := kv.rsm.Submit(*args)
+	if err != rpc.OK {
+		reply.Err = err
+		return
+	}
+	r := rep.(rpc.GetReply)
+	*reply = r
 }
 
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
-	// Your code here. Use kv.rsm.Submit() to submit args
-	// You can use go's type casts to turn the any return value
-	// of Submit() into a PutReply: rep.(rpc.PutReply)
+	if atomic.LoadInt32(&kv.dead) == 1 {
+		reply.Err = rpc.ErrWrongLeader
+		return
+	}
+	err, rep := kv.rsm.Submit(*args)
+	if err != rpc.OK {
+		reply.Err = err
+		return
+	}
+	r := rep.(rpc.PutReply)
+	*reply = r
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -77,7 +147,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
 
-	kv := &KVServer{me: me}
+	kv := &KVServer{me: me, kv: make(map[string]string), vers: make(map[string]rpc.Tversion)}
 
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)

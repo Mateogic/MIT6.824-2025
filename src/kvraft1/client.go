@@ -4,6 +4,7 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/tester1"
+	"time"
 )
 
 
@@ -11,10 +12,11 @@ type Clerk struct {
 	clnt    *tester.Clnt
 	servers []string
 	// You will have to modify this struct.
+	lastLeader int
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
-	ck := &Clerk{clnt: clnt, servers: servers}
+	ck := &Clerk{clnt: clnt, servers: servers, lastLeader: 0}
 	// You'll have to add code here.
 	return ck
 }
@@ -30,9 +32,22 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
-
-	// You will have to modify this function.
-	return "", 0, ""
+	args := rpc.GetArgs{Key: key}
+	// keep trying different servers until OK
+	start := ck.lastLeader
+	n := len(ck.servers)
+	for {
+		for i := 0; i < n; i++ {
+			s := (start + i) % n
+			var reply rpc.GetReply
+			ok := ck.clnt.Call(ck.servers[s], "KVServer.Get", &args, &reply)
+			if ok && (reply.Err == rpc.OK || reply.Err == rpc.ErrNoKey) {
+				ck.lastLeader = s
+				return reply.Value, reply.Version, reply.Err
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // Put updates key with value only if the version in the
@@ -53,6 +68,38 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
-	return ""
+	args := rpc.PutArgs{Key: key, Value: value, Version: version}
+	start := ck.lastLeader
+	n := len(ck.servers)
+	didFirstRPC := false // becomes true after the first successful RPC (any reply)
+	for {
+		for i := 0; i < n; i++ {
+			s := (start + i) % n
+			var reply rpc.PutReply
+			ok := ck.clnt.Call(ck.servers[s], "KVServer.Put", &args, &reply)
+			if ok {
+				if !didFirstRPC {
+					didFirstRPC = true
+				}
+				switch reply.Err {
+				case rpc.OK:
+					ck.lastLeader = s
+					return rpc.OK
+				case rpc.ErrVersion:
+					if !didFirstRPC { // first ok RPC and it's ErrVersion
+						return rpc.ErrVersion
+					}
+					return rpc.ErrMaybe
+				case rpc.ErrNoKey:
+					ck.lastLeader = s
+					return rpc.ErrNoKey
+				case rpc.ErrWrongLeader:
+					// try next
+				default:
+					// unexpected; try next
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
