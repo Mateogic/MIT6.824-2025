@@ -65,7 +65,7 @@ func (sck *ShardCtrler) InitController() {
 		cur = shardcfg.FromString(curVal)
 	}
 	// read next; if absent, nothing to recover
-	nextVal, _, err := sck.IKVClerk.Get(cfgNextKey)
+	nextVal, nextVer, err := sck.IKVClerk.Get(cfgNextKey)
 	if err == rpc.ErrNoKey {
 		return
 	}
@@ -74,8 +74,20 @@ func (sck *ShardCtrler) InitController() {
 	if next.Num <= cur.Num {
 		return
 	}
-	// finish migration to next
-	sck.ChangeConfigTo(next)
+	
+	// For 5C: Try to acquire ownership of this next config before proceeding
+	// Re-try to set the same next config to verify we can proceed
+	if putErr := sck.IKVClerk.Put(cfgNextKey, next.String(), nextVer); putErr != rpc.OK && putErr != rpc.ErrMaybe {
+		if putErr == rpc.ErrVersion {
+			dlogf("[sck] InitController: another controller is handling recovery")
+			return
+		}
+		// Other error, still try to recover as this might be network issue
+		dlogf("[sck] InitController: put error %v, proceeding anyway", putErr)
+	}
+	
+	// finish migration to next (using the internal method)
+	sck.doShardMigration(cur, next)
 }
 
 // Called once by the tester to supply the first configuration.  You
@@ -109,17 +121,54 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	if sck.IKVClerk == nil {
 		log.Fatalf("ChangeConfigTo: IKVClerk is nil")
 	}
-	// try to upsert next: read current version first
+	
+	// For 5C: Use versioned Put to ensure only one controller can set the next config
+	// Try to atomically update the next configuration
+	var canProceed bool
 	if val, ver, err := sck.IKVClerk.Get(cfgNextKey); err == rpc.ErrNoKey {
-		_ = sck.IKVClerk.Put(cfgNextKey, new.String(), 0)
+		// No next config exists, try to set it
+		if putErr := sck.IKVClerk.Put(cfgNextKey, new.String(), 0); putErr == rpc.OK || putErr == rpc.ErrMaybe {
+			canProceed = true
+		} else {
+			// Another controller set it first, we should not proceed
+			dlogf("[sck] ChangeConfigTo: failed to set next config (no existing), another controller won")
+			return
+		}
 	} else {
-		// only update if our new has higher Num to avoid overwriting a newer plan
+		// Next config exists, check if we should update it
 		old := shardcfg.FromString(val)
 		if old.Num < new.Num {
-			// best-effort update; ignore errors for 5B if racing
-			_ = sck.IKVClerk.Put(cfgNextKey, new.String(), ver)
+			// Try to update with the current version
+			if putErr := sck.IKVClerk.Put(cfgNextKey, new.String(), ver); putErr == rpc.OK || putErr == rpc.ErrMaybe {
+				canProceed = true
+			} else if putErr == rpc.ErrVersion {
+				// Version conflict - another controller updated it
+				dlogf("[sck] ChangeConfigTo: version conflict, another controller won")
+				return
+			} else {
+				// Other error, don't proceed
+				dlogf("[sck] ChangeConfigTo: failed to update next config: %v", putErr)
+				return
+			}
+		} else {
+			// Our config is not newer, don't proceed
+			dlogf("[sck] ChangeConfigTo: next config num=%d >= our num=%d, not proceeding", old.Num, new.Num)
+			return
 		}
 	}
+	
+	// Only proceed if we successfully set the next configuration
+	if !canProceed {
+		dlogf("[sck] ChangeConfigTo: cannot proceed, another controller is handling this config")
+		return
+	}
+	
+	// Perform the actual shard migration
+	sck.doShardMigration(cur, new)
+}
+
+// doShardMigration performs the actual shard migration between configurations
+func (sck *ShardCtrler) doShardMigration(cur, new *shardcfg.ShardConfig) {
 	// For each shard, if moving from gidA->gidB
 	// Keep retrying until Freeze/Install/Delete succeed (OK or ErrVersion),
 	// so that we don't publish a config that points clients at a group that
